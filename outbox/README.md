@@ -23,6 +23,29 @@ end-to-end, DDIA гл. 13) и строгого порядка при ретра�
 одного агрегата могут обменяться местами (DDIA гл. 12, Fig. 12-2). Потребителям,
 которым важен порядок, следует носить версию агрегата в payload.
 
+## Словарь
+
+Релей устроен как цикл из четырёх шагов; эти слова встречаются в коде и логах:
+
+- **батч (batch)** — до `BatchSize` строк, взятых из таблицы за один раз.
+- **claim («захват»)** — транзакция, которая *бронирует* строки: `SELECT … FOR
+  UPDATE SKIP LOCKED` + сразу `attempts = attempts + 1` и `next_attempt_at =
+  now() + backoff`. После её коммита строки считаются «взятыми в работу»:
+  другой релей их не увидит, а крах релея оставит им запланированный ретрай.
+  Claim только захватывает и возвращает данные — наружу он ничего не
+  отправляет.
+- **publish** — передача захваченных событий `Publisher`'у, по одному, в
+  порядке `id`.
+- **mark** — запись исхода: `processed_at` (успех) / `last_error` (провал,
+  будет ретрай) / `dead_at` (провал исчерпал попытки).
+- **drain («догон»)** — внутренний цикл `claim → publish → mark`, повторяемый,
+  пока батч не станет пустым. Пустой батч = очередь догнана до нуля, релей
+  засыпает до следующего NOTIFY или тика.
+- **headers** — метаданные события «строка → строка», аналог HTTP-заголовков:
+  `correlation_id`, `schema_version` и т.п. Хранятся отдельно от `payload`,
+  чтобы потребители читали их без разбора тела; в Kafka кладутся в заголовки
+  сообщения.
+
 ## Схема и контракт
 
 `migrations/0001_outbox.up.sql`. Публичный контракт — только форма событий:
@@ -114,34 +137,71 @@ INSERT INTO processed_events (event_id) VALUES ($1)   -- event_id из собы�
 ON CONFLICT (event_id) DO NOTHING;                    -- 0 затронутых строк = дубликат, пропустить
 ```
 
-## Kafka-паблишер (скетч)
+## Kafka-паблишер (franz-go)
 
 ```go
-type KafkaPublisher struct{ w *kafka.Writer } // segmentio/kafka-go
+import "github.com/twmb/franz-go/pkg/kgo"
 
-func NewKafkaPublisher(brokers []string, topic string) *KafkaPublisher {
-	return &KafkaPublisher{w: &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        topic,
-		Balancer:     &kafka.Hash{},        // aggregate_id -> партиция = порядок по ключу
-		RequiredAcks: kafka.RequireAll,     // "durably accepted" == acks=all
-		BatchSize:    1,                    // сохраняем порядок; батчит сам брокер-клиент
-		Async:        false,
-	}}
+type KafkaPublisher struct {
+	cl    *kgo.Client
+	topic string
+}
+
+func NewKafkaPublisher(brokers []string, topic string) (*KafkaPublisher, error) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()), // "durably accepted" == acks=all
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &KafkaPublisher{cl: cl, topic: topic}, nil
 }
 
 func (p *KafkaPublisher) Publish(ctx context.Context, evt outbox.Event) error {
-	return p.w.WriteMessages(ctx, kafka.Message{
+	return p.cl.ProduceSync(ctx, &kgo.Record{
+		Topic: p.topic,
+		// aggregate_id -> партиция: порядок по ключу сохраняет Kafka
 		Key:   []byte(evt.AggregateID),
 		Value: evt.Payload,
-		Headers: []kafka.Header{{Key: "event_id", Value: []byte(evt.EventID)},
-			{Key: "event_type", Value: []byte(evt.EventType)}},
-	})
+		Headers: []kgo.RecordHeader{
+			{Key: "event_id", Value: []byte(evt.EventID)},
+			{Key: "event_type", Value: []byte(evt.EventType)},
+		},
+	}).FirstErr()
 }
 ```
 
+franz-go — «кооперативный» клиент: `ProduceSync(ctx, …)` уважает контекст —
+при отмене/дедлайне (`PublishTimeout` релея) отдаёт ошибку контекста, а каждая
+попытка отправки ограничена собственным таймаутом клиента. С такими клиентами
+таймаут релея работает из коробки. Watchdog (принудительное прерывание
+горутины-паблишера) нужен только против «некооперативного» кода — клиента,
+который игнорирует ctx и крутит собственный бесконечный ретрай.
+
 Fan-out на нескольких потребителей — работа consumer groups Kafka (DDIA гл. 12,
 «Multiple consumers»); outbox-таблица знает только «довезти до брокера».
+
+## Метрики
+
+`OnDead`-хук и `Relay.Stats()` — сырьё для метрик. Рекомендуемый набор
+(Prometheus-имена; тип указан в скобках):
+
+| Метрика | Тип | Откуда | Зачем |
+|---|---|---|---|
+| `outbox_events_deadlettered_total{event_type}` | counter | `OnDead` | главное: любое приращение = инцидент |
+| `outbox_events_published_total{event_type}` | counter | декоратор Publisher | темп доставки |
+| `outbox_publish_failures_total{event_type}` | counter | декоратор Publisher | деградация даунстрима до DLQ |
+| `outbox_delivery_lag_seconds` | histogram | декоратор: `now − evt.CreatedAt` | e2e-задержка «коммит → брокер» |
+| `outbox_pending_events` | gauge | SQL-поллер (запрос backlog ниже) | глубина очереди |
+| `outbox_oldest_pending_seconds` | gauge | SQL-поллер | **золотой сигнал**: возраст старейшего недоставленного — ловит «тихие» зависания, когда счётчики вроде бы живы |
+| `outbox_deadletter_backlog` | gauge | SQL-поллер | мёртвые, которые никто не разобрал |
+| `outbox_relay_is_leader` | gauge 0/1 | факт владения локом | кто активен; частые смены = нестабильность |
+
+Правила гигиены: в метках — только `event_type` (ограниченная кардинальность);
+никогда `aggregate_id`/`event_id` (взрыв кардинальности). Декоратор Publisher
+(обёртка, инкрементирующая счётчики вокруг любого `Publisher`) держит метрики
+вне пакета — релей остаётся без зависимостей от мониторинга.
 
 ## Мониторинг
 

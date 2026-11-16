@@ -81,9 +81,14 @@ type Config struct {
 	Logger *slog.Logger
 
 	// OnDead, if set, is invoked once for every event that is
-	// dead-lettered. Use it to page an operator: a dead event needs
-	// human intervention (fix payload, fix code, or drop it).
-	OnDead func(evt Event, err error)
+	// dead-lettered (publish failed MaxAttempts times). The ctx is the
+	// relay's run context: it is cancelled while the relay is shutting
+	// down, so a well-behaved hook can cut its own work short.
+	//
+	// The hook is called synchronously in the delivery loop: it must be
+	// fast — a log line and a metric bump. If you need slow alerting
+	// (PagerDuty et al.), enqueue inside the hook and return.
+	OnDead func(ctx context.Context, evt Event, err error)
 }
 
 var channelRe = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
@@ -456,10 +461,23 @@ func (r *Relay) claim(ctx context.Context, work *pgx.Conn) ([]Event, error) {
 		newAttempts[i] = int32(e.Attempts)
 		delays[i] = r.retryDelay(e.Attempts).Seconds()
 	}
-	// clock_timestamp(), not now(): the delay must count from the moment the
-	// retry is booked (statement time), not from the transaction start, or
-	// time spent planning/executing the claim itself would eat into (and,
-	// with tiny delays, even consume) the backoff window.
+	// clock_timestamp(), not now(): this is a correctness fix, not a style
+	// choice. In PostgreSQL now() == transaction_timestamp() == the moment
+	// the CLAIM transaction began, fixed for its whole lifetime. Picture a
+	// 20ms retry delay and a claim that takes 50ms:
+	//
+	//   T0=10:00:00.000  BEGIN;                     -- now() locks in T0
+	//   T0+30ms          SELECT ... FOR UPDATE      -- scanning, locking
+	//   T0+45ms          UPDATE ... now()+20ms  -> next_attempt_at = T0+20ms
+	//   T0+50ms          COMMIT;                    -- row becomes visible HERE
+	//
+	// next_attempt_at (T0+20ms) is already in the past at commit (T0+50ms),
+	// so the next claim picks the row up immediately: the backoff we tried
+	// to schedule was silently consumed by the claim's own execution time.
+	// Effective delay was max(0, delay - claim_duration), i.e. no delay at
+	// all whenever a claim runs longer than the delay. clock_timestamp() is
+	// the true wall clock at statement time, so the delay counts from the
+	// moment the retry is actually booked.
 	if _, err := tx.Exec(qctx, `
 		UPDATE outbox o
 		SET attempts       = u.attempts,
@@ -517,7 +535,7 @@ func (r *Relay) process(ctx context.Context, work *pgx.Conn, evt Event) error {
 			"id", evt.ID, "event_id", evt.EventID, "type", evt.EventType,
 			"aggregate", evt.AggregateID, "attempts", evt.Attempts, "error", pubErr)
 		if r.cfg.OnDead != nil {
-			r.cfg.OnDead(evt, pubErr)
+			r.cfg.OnDead(ctx, evt, pubErr)
 		}
 		return nil
 	}

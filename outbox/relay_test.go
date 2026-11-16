@@ -329,7 +329,7 @@ func TestRetryThenDeadLetter(t *testing.T) {
 	dead := make(chan Event, 1)
 	col := newCollector(map[string]int{"flaky": 2, "poison": 1000})
 	startRelay(t, dsn, col, func(cfg *Config) {
-		cfg.OnDead = func(evt Event, _ error) { dead <- evt }
+		cfg.OnDead = func(_ context.Context, evt Event, _ error) { dead <- evt }
 	})
 
 	// Everything except the poison event eventually goes through.

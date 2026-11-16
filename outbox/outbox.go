@@ -63,11 +63,21 @@ type NewEvent struct {
 	Headers map[string]string
 }
 
-// maxAppendEvents bounds the rows per INSERT statement. Each row binds 4
-// parameters and PostgreSQL's extended protocol caps a statement at 65535
-// of them, so an unchunked Append would fail at ~16k events with a confusing
-// protocol error. All chunks share the caller's transaction, so atomicity
-// is unaffected.
+// maxAppendEvents bounds the rows per INSERT statement. The wire protocol
+// (Bind message) stores the bind-parameter count in a 16-bit field, so a
+// single statement cannot have more than 65535 placeholders. Append binds 4
+// parameters per event (event_type, aggregate_id, payload, headers), so an
+// unchunked multi-row INSERT breaks at 16384 events:
+//
+//	16383 events * 4 params = 65532  -- fits
+//	16384 events * 4 params = 65536  -- protocol error, statement rejected
+//
+// and because that INSERT runs inside the caller's transaction, one overly
+// large Append (bulk imports, migrations) would fail the whole business
+// transaction with a confusing low-level error. Hence chunks of 16000 rows
+// (64000 params, a comfortable margin below the cap): several INSERT
+// statements, still one transaction — all-or-nothing semantics are those of
+// the caller's COMMIT, unchanged.
 const maxAppendEvents = 16000
 
 // appendRow is a NewEvent validated and marshalled for INSERT.

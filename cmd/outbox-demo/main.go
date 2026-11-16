@@ -84,8 +84,8 @@ func main() {
 			RetryMaxDelay:  1 * time.Second,
 			PollInterval:   500 * time.Millisecond,
 			LockRetry:      200 * time.Millisecond,
-			OnDead: func(evt outbox.Event, err error) {
-				logger.Error("ALERT: event dead-lettered, operator action required",
+			OnDead: func(ctx context.Context, evt outbox.Event, err error) {
+				logger.ErrorContext(ctx, "ALERT: event dead-lettered, operator action required",
 					"id", evt.ID, "event_id", evt.EventID, "type", evt.EventType, "error", err)
 			},
 		})
