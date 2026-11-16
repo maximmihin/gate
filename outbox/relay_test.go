@@ -78,7 +78,9 @@ func (c *collector) snapshot() []Event {
 	return append([]Event(nil), c.events...)
 }
 
-func startRelay(t *testing.T, dsn string, pub Publisher, mut func(*Config)) (*Relay, context.CancelFunc) {
+// baseConfig returns the shared test relay configuration: fast retries,
+// short polls, quiet logger. mut can tweak fields before NewRelay runs.
+func baseConfig(t *testing.T, dsn string, pub Publisher, mut func(*Config)) Config {
 	t.Helper()
 	cc, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -100,7 +102,12 @@ func startRelay(t *testing.T, dsn string, pub Publisher, mut func(*Config)) (*Re
 	if mut != nil {
 		mut(&cfg)
 	}
-	relay, err := NewRelay(cfg)
+	return cfg
+}
+
+func startRelay(t *testing.T, dsn string, pub Publisher, mut func(*Config)) (*Relay, context.CancelFunc) {
+	t.Helper()
+	relay, err := NewRelay(baseConfig(t, dsn, pub, mut))
 	if err != nil {
 		t.Fatalf("new relay: %v", err)
 	}
@@ -298,19 +305,18 @@ func TestRelayDeliversInOrder(t *testing.T) {
 		last = evt.ID
 	}
 
+	// Wait on the durable DB state, not on the collector: a delivered event
+	// is recorded by the collector before its processed_at UPDATE commits.
 	ctx := context.Background()
-	var processed, maxAttempts int
-	if err := conn.QueryRow(ctx,
-		"SELECT count(*) FILTER (WHERE processed_at IS NOT NULL), coalesce(max(attempts), 0) FROM outbox",
-	).Scan(&processed, &maxAttempts); err != nil {
-		t.Fatalf("query outcomes: %v", err)
-	}
-	if processed != 12 {
-		t.Fatalf("processed = %d, want 12", processed)
-	}
-	if maxAttempts != 1 {
-		t.Fatalf("max attempts = %d, want 1 on the happy path", maxAttempts)
-	}
+	waitFor(t, 5*time.Second, "all 12 events processed in one attempt", func() bool {
+		var processed, maxAttempts int
+		if err := conn.QueryRow(ctx,
+			"SELECT count(*) FILTER (WHERE processed_at IS NOT NULL), coalesce(max(attempts), 0) FROM outbox",
+		).Scan(&processed, &maxAttempts); err != nil {
+			t.Fatalf("query outcomes: %v", err)
+		}
+		return processed == 12 && maxAttempts == 1
+	})
 }
 
 func TestRetryThenDeadLetter(t *testing.T) {
