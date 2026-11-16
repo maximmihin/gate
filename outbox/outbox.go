@@ -63,19 +63,32 @@ type NewEvent struct {
 	Headers map[string]string
 }
 
+// maxAppendEvents bounds the rows per INSERT statement. Each row binds 4
+// parameters and PostgreSQL's extended protocol caps a statement at 65535
+// of them, so an unchunked Append would fail at ~16k events with a confusing
+// protocol error. All chunks share the caller's transaction, so atomicity
+// is unaffected.
+const maxAppendEvents = 16000
+
+// appendRow is a NewEvent validated and marshalled for INSERT.
+type appendRow struct {
+	eventType   string
+	aggregateID string
+	payload     string // JSON text for the jsonb column
+	headers     string // JSON object text for the jsonb column
+}
+
 // Append inserts events into the outbox table using the caller's
 // transaction. Committing or rolling back that transaction is the caller's
 // job: Append only ever runs inside it, which is what makes the write
-// atomic with the business change.
+// atomic with the business change. All events are validated and marshalled
+// before the first statement runs, so an invalid event inserts nothing.
 func Append(ctx context.Context, tx pgx.Tx, events ...NewEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO outbox (event_type, aggregate_id, payload, headers) VALUES ")
-	args := make([]any, 0, len(events)*4)
-
+	rows := make([]appendRow, len(events))
 	for i, e := range events {
 		if e.EventType == "" || e.AggregateID == "" {
 			return fmt.Errorf("outbox: event %d: EventType and AggregateID are required", i)
@@ -92,12 +105,36 @@ func Append(ctx context.Context, tx pgx.Tx, events ...NewEvent) error {
 		if err != nil {
 			return fmt.Errorf("outbox: event %d: marshal headers: %w", i, err)
 		}
+		rows[i] = appendRow{
+			eventType:   e.EventType,
+			aggregateID: e.AggregateID,
+			payload:     string(payload),
+			headers:     string(headerJSON),
+		}
+	}
+
+	for start := 0; start < len(rows); start += maxAppendEvents {
+		end := min(start+maxAppendEvents, len(rows))
+		if err := appendRows(ctx, tx, rows[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// appendRows emits one multi-row INSERT for a chunk of pre-marshalled events.
+func appendRows(ctx context.Context, tx pgx.Tx, rows []appendRow) error {
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO outbox (event_type, aggregate_id, payload, headers) VALUES ")
+	args := make([]any, 0, len(rows)*4)
+
+	for i, r := range rows {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		n := len(args)
 		fmt.Fprintf(&sb, "($%d, $%d, $%d::jsonb, $%d::jsonb)", n+1, n+2, n+3, n+4)
-		args = append(args, e.EventType, e.AggregateID, string(payload), string(headerJSON))
+		args = append(args, r.eventType, r.aggregateID, r.payload, r.headers)
 	}
 
 	_, err := tx.Exec(ctx, sb.String(), args...)

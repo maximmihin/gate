@@ -255,11 +255,25 @@ func (r *Relay) runOnce(ctx context.Context) error {
 	defer closeConn(notify)
 
 	gctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	wake := make(chan struct{}, 1)
 	listenErr := make(chan error, 1)
-	go func() { listenErr <- r.listen(gctx, notify, wake) }()
+	listenerDone := make(chan struct{})
+	go func() {
+		defer close(listenerDone)
+		listenErr <- r.listen(gctx, notify, wake)
+	}()
+
+	// stopListener must run before the deferred closeConn(notify) below:
+	// cancelling gctx only *starts* unwinding the listener goroutine out of
+	// WaitForNotification, and closing the connection while it is still in
+	// there races on pgconn internals (the race detector catches it). The
+	// send on listenErr is buffered, so the goroutine always completes.
+	stopListener := func() {
+		cancel()
+		<-listenerDone
+	}
+	defer stopListener()
 
 	if err := r.acquireLock(gctx, work, listenErr); err != nil {
 		return err
@@ -442,10 +456,14 @@ func (r *Relay) claim(ctx context.Context, work *pgx.Conn) ([]Event, error) {
 		newAttempts[i] = int32(e.Attempts)
 		delays[i] = r.retryDelay(e.Attempts).Seconds()
 	}
+	// clock_timestamp(), not now(): the delay must count from the moment the
+	// retry is booked (statement time), not from the transaction start, or
+	// time spent planning/executing the claim itself would eat into (and,
+	// with tiny delays, even consume) the backoff window.
 	if _, err := tx.Exec(qctx, `
 		UPDATE outbox o
 		SET attempts       = u.attempts,
-		    next_attempt_at = now() + make_interval(secs => u.delay_s)
+		    next_attempt_at = clock_timestamp() + make_interval(secs => u.delay_s)
 		FROM unnest($1::bigint[], $2::int4[], $3::float8[]) AS u(id, attempts, delay_s)
 		WHERE o.id = u.id`, ids, newAttempts, delays); err != nil {
 		return nil, fmt.Errorf("claim: schedule retries: %w", err)
