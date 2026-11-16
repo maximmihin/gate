@@ -1,0 +1,7 @@
+# go build artifacts
+/cmd/outbox-demo/outbox-demo
+*.test
+*.out
+
+# local env
+.env
