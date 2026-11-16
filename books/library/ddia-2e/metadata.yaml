@@ -1,0 +1,20 @@
+slug: "ddia-2e"
+title: "Designing Data-Intensive Applications, 2nd Edition"
+authors: ["Martin Kleppmann", "Chris Riccomini"]
+edition: "2nd Edition"
+year: "2026"
+publisher: "O'Reilly Media, Inc."
+isbn: "9781449373320"
+language: "en"
+source_original: "originals/Kleppmann M., Riccomini C. - Designing Data-Intensive Applications, 2nd Edition - 2026.epub"
+ingested_at: 2026-11-16
+generator: .opencode/skills/book-ingest/scripts/epub_to_md.py
+description: >-
+  Data is at the center of many challenges in system design today. Difficult issues such as
+  scalability, consistency, reliability, efficiency, and maintainability need to be resolved. In
+  addition, there's an overwhelming variety of systems, including relational databases, NoSQL
+  datastores, data warehouses, and data lakes. In this second edition, authors Martin Kleppmann
+  and Chris Riccomini build on the foundation laid in the acclaimed first edition, integrating new
+  technologies and emerging trends. You'll be guided through the maze of decisions and trade-offs
+  involved in building a modern data system, learn how to choose the right tools for your needs,
+  and understand the fundamentals of distributed systems.
