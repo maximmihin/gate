@@ -234,6 +234,48 @@ func TestNotifyOnlyOnCommit(t *testing.T) {
 	}
 }
 
+// TestRetryDelayMath pins the retry policy semantics: attempt 1 waits the
+// base delay, each next attempt doubles it, RetryMaxDelay caps the growth,
+// and every draw is jittered by at most RetryJitter (wait.Jitter draws
+// uniformly from [d, d*(1+jitter)]).
+func TestRetryDelayMath(t *testing.T) {
+	relay, err := NewRelay(Config{
+		ConnConfig:     &pgx.ConnConfig{},
+		Publisher:      newCollector(nil),
+		RetryBaseDelay: 20 * time.Millisecond,
+		RetryMaxDelay:  100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new relay: %v", err)
+	}
+
+	for attempts, want := range map[int]time.Duration{
+		1:  20 * time.Millisecond,
+		2:  40 * time.Millisecond,
+		3:  80 * time.Millisecond,
+		4:  100 * time.Millisecond, // 160ms capped
+		99: 100 * time.Millisecond,
+	} {
+		for i := 0; i < 50; i++ {
+			got := relay.retryDelay(attempts)
+			hi := want + time.Duration(float64(want)*relay.cfg.RetryJitter)
+			if got < want || got > hi {
+				t.Fatalf("retryDelay(%d) = %v, want within [%v, %v]", attempts, got, want, hi)
+			}
+		}
+	}
+
+	// Jitter must be drawn per call, so a failed batch does not retry as a
+	// synchronized herd.
+	var distinct bool
+	for i := 0; i < 100 && !distinct; i++ {
+		distinct = relay.retryDelay(1) != relay.retryDelay(1)
+	}
+	if !distinct {
+		t.Fatal("retryDelay draws identical jitter for every row")
+	}
+}
+
 func TestRelayDeliversInOrder(t *testing.T) {
 	conn, dsn := setup(t)
 

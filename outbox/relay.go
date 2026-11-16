@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"regexp"
 	"sync/atomic"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -30,6 +33,7 @@ const (
 	DefaultMaxAttempts    = 8
 	DefaultRetryBaseDelay = time.Second
 	DefaultRetryMaxDelay  = time.Minute
+	DefaultRetryJitter    = 0.1
 	DefaultQueryTimeout   = 30 * time.Second
 	DefaultPublishTimeout = 30 * time.Second
 )
@@ -59,6 +63,16 @@ type Config struct {
 	RetryMaxDelay  time.Duration // exponential backoff cap (default 1m)
 	QueryTimeout   time.Duration // client-side timeout for outbox queries (default 30s)
 	PublishTimeout time.Duration // per-event timeout passed to Publisher (default 30s)
+
+	// RetryJitter is the fraction of random spread added on top of every
+	// retry and reconnect delay: a delay d is drawn uniformly from
+	// [d, d*(1+RetryJitter)). It de-synchronizes the retries of a batch of
+	// events that failed together on one broker hiccup (anti
+	// thundering herd) and the lock retries of standby relays. Values <= 0
+	// get DefaultRetryJitter; note that 0 cannot mean "no jitter", because
+	// wait.Jitter treats a non-positive factor as 1.0 (full jitter).
+	// Must be < 1 (default 0.1).
+	RetryJitter float64
 
 	// Publisher receives claimed events, one call at a time, in id order
 	// within a batch. Returning nil means "durably accepted downstream".
@@ -146,6 +160,12 @@ func NewRelay(cfg Config) (*Relay, error) {
 	if cfg.RetryMaxDelay <= 0 {
 		cfg.RetryMaxDelay = DefaultRetryMaxDelay
 	}
+	if cfg.RetryJitter <= 0 {
+		cfg.RetryJitter = DefaultRetryJitter
+	}
+	if cfg.RetryJitter >= 1 {
+		return nil, fmt.Errorf("outbox: Config.RetryJitter must be < 1, got %v", cfg.RetryJitter)
+	}
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = DefaultQueryTimeout
 	}
@@ -183,24 +203,39 @@ func NewRelay(cfg Config) (*Relay, error) {
 // lets a standby take over quickly. It always returns a non-nil error
 // (context.Canceled or context.DeadlineExceeded on shutdown).
 func (r *Relay) Run(ctx context.Context) error {
-	const maxBackoff = 30 * time.Second
-	backoff := time.Second
+	// Reconnect policy via wait.Backoff (the machinery underneath
+	// client-go's retry): 1s doubling up to 30s, jittered. The backoff is
+	// reset, by rebuilding it (current apimachinery has no Reset),
+	// whenever the previous session stayed healthy long enough, so a
+	// long-lived relay that loses its connection once does not wait 30s.
+	const (
+		sessionHealthyAfter = 30 * time.Second
+		reconnectCap        = 30 * time.Second
+	)
+	newReconnect := func() wait.Backoff {
+		return wait.Backoff{
+			Duration: time.Second,
+			Factor:   2,
+			Jitter:   r.cfg.RetryJitter,
+			Steps:    math.MaxInt32, // unbounded; Cap stops the growth
+			Cap:      reconnectCap,
+		}
+	}
+	reconnect := newReconnect()
 	for {
 		start := time.Now()
 		err := r.runOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if time.Since(start) >= maxBackoff {
-			backoff = time.Second // the previous session was healthy; reset
+		if time.Since(start) >= sessionHealthyAfter {
+			reconnect = newReconnect() // the previous session was healthy; reset
 		}
-		r.log.Warn("outbox relay: connection lost, reconnecting", "error", err, "backoff", backoff)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
+		delay := reconnect.Step()
+		r.log.Warn("outbox relay: connection lost, reconnecting", "error", err, "backoff", delay)
+		if err := sleepCtx(ctx, delay); err != nil {
+			return err
 		}
-		backoff = min(backoff*2, maxBackoff)
 	}
 }
 
@@ -293,6 +328,9 @@ func (r *Relay) acquireLock(ctx context.Context, work *pgx.Conn, listenErr <-cha
 		if locked {
 			return nil
 		}
+		// Jittered via the same wait.Jitter the reconnect backoff uses, so
+		// a herd of standbys does not hammer pg_try_advisory_lock in
+		// lockstep after a leader dies.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -301,7 +339,7 @@ func (r *Relay) acquireLock(ctx context.Context, work *pgx.Conn, listenErr <-cha
 				return ctx.Err()
 			}
 			return fmt.Errorf("listener while waiting for lock: %w", err)
-		case <-time.After(r.cfg.LockRetry):
+		case <-time.After(wait.Jitter(r.cfg.LockRetry, r.cfg.RetryJitter)):
 		}
 	}
 }
@@ -402,7 +440,7 @@ func (r *Relay) claim(ctx context.Context, work *pgx.Conn) ([]Event, error) {
 	for i, e := range events {
 		ids[i] = e.ID
 		newAttempts[i] = int32(e.Attempts)
-		delays[i] = r.backoff(e.Attempts).Seconds()
+		delays[i] = r.retryDelay(e.Attempts).Seconds()
 	}
 	if _, err := tx.Exec(qctx, `
 		UPDATE outbox o
@@ -472,24 +510,48 @@ func (r *Relay) process(ctx context.Context, work *pgx.Conn, evt Event) error {
 	}
 	r.log.Warn("outbox relay: publish failed, will retry",
 		"id", evt.ID, "event_id", evt.EventID, "type", evt.EventType,
-		"attempts", evt.Attempts, "next_delay", r.backoff(evt.Attempts), "error", pubErr)
+		"attempts", evt.Attempts, "next_delay", r.retryDelay(evt.Attempts), "error", pubErr)
 	return nil
 }
 
-// backoff returns the delay before attempt n (1-based): base * 2^(n-1),
-// capped at RetryMaxDelay.
-func (r *Relay) backoff(attempts int) time.Duration {
+// retryDelay returns the delay before attempt n (1-based): base * 2^(n-1),
+// capped at RetryMaxDelay, with uniform jitter in [0, RetryJitter*delay]
+// drawn independently on every call, so a batch of events that failed
+// together on one broker hiccup retries spread out instead of as a
+// synchronized herd.
+//
+// The exponent-and-cap core mirrors wait.Backoff's delay math; the jitter is
+// wait.Jitter itself (the same function Backoff.Step applies). Apimachinery
+// has no stateless DurationForAttempt to delegate the whole computation to.
+func (r *Relay) retryDelay(attempts int) time.Duration {
 	d := r.cfg.RetryBaseDelay
 	for i := 1; i < attempts && d < r.cfg.RetryMaxDelay; i++ {
 		d *= 2
 	}
-	return min(d, r.cfg.RetryMaxDelay)
+	return wait.Jitter(min(d, r.cfg.RetryMaxDelay), r.cfg.RetryJitter)
 }
 
 func nudge(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default: // a wakeup is already pending; coalesce
+	}
+}
+
+// sleepCtx pauses for d, returning ctx.Err() immediately when ctx is done,
+// so graceful shutdown never waits out a backoff delay. (Apimachinery's
+// wait package has no ctx-aware sleep in current versions.)
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
